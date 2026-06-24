@@ -42,6 +42,10 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir \
     buildozer \
     cython
 
+# Pre-create build-home so any uid can write pip --user packages and buildozer cache
+RUN mkdir -p /tmp/build-home/.local /tmp/build-home/.cache/pip \
+    && chmod -R 777 /tmp/build-home
+
 WORKDIR /work
 
 CMD ["buildozer", "android", "debug"]
