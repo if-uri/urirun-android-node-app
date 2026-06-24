@@ -76,6 +76,27 @@ One-command build and publish:
 ./scripts/build-and-publish.sh
 ```
 
+## Build in Docker
+
+If you do not want to install Buildozer and the Android toolchain directly on
+the host, build the debug APK in Docker:
+
+```bash
+cd /home/tom/github/if-uri/urirun-android-node-app
+make docker-apk
+```
+
+This builds the local image from `docker/Dockerfile.android-dev`, runs
+`buildozer android debug` with the repo mounted at `/work`, then copies
+`bin/*.apk` to:
+
+```text
+/home/tom/github/if-uri/urirun-service-android-node/apk
+```
+
+If Docker is installed but the command says the daemon is not reachable, run it
+from a normal host terminal with Docker access.
+
 ## Test the URI API
 
 After installing and opening the APK on Android, read the URL shown in the app,
