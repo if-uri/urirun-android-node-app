@@ -1,0 +1,10 @@
+task:
+  id: android-node-ping
+  title: Ping Android URI node app
+steps:
+  - id: ping-android-app
+    uri: android://device/app/command/ping
+    payload:
+      from: urirun-flow
+    depends_on: []
+

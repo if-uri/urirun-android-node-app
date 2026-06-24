@@ -1,0 +1,9 @@
+task:
+  id: android-node-status
+  title: Read Android URI node app status
+steps:
+  - id: android-app-status
+    uri: android://device/app/query/status
+    payload: {}
+    depends_on: []
+

@@ -1,0 +1,8 @@
+.buildozer/
+bin/
+*.apk
+*.aab
+*.log
+__pycache__/
+.pytest_cache/
+
