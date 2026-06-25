@@ -1,112 +1,88 @@
 # urirun-android-node-app
 
-Android application that exposes a small URI node directly on the device.
+Android application that exposes a URI node HTTP API directly on the device.
 
-It is different from the webpage relay:
+Contrast with the webpage relay approach:
 
-- webpage relay: phone opens `http://HOST:8195/`, host controls it through a relay;
-- Android node app: APK runs on Android and exposes its own local API, usually
-  `http://ANDROID_IP:8765`.
+| | webpage relay | Android node app |
+|---|---|---|
+| who runs code | host PC | Android device |
+| phone requirement | any browser | APK installed |
+| API address | `http://HOST:8195/` | `http://ANDROID_IP:8765` |
+| background operation | tab must stay open | foreground service, survives minimize |
+
+## Architecture
+
+The APK runs two components:
+
+- **Kivy activity** — shows the device IP, service status, and Termux controls.
+- **Foreground service** (`service/main.py`) — hosts the HTTP API in its own Android process. Declared with `foreground:sticky` so Android does not kill it when the activity is backgrounded or the screen turns off.
+
+The activity communicates with the service via `http://127.0.0.1:8765`.
 
 ## URI API
 
-The app listens on port `8765` and exposes:
+The service listens on port `8765` (override with env `URIRUN_ANDROID_APP_PORT`).
 
-```text
-GET  /health
-GET  /routes
-POST /run
+```
+GET  /health   — status JSON
+GET  /routes   — list of registered URI routes
+POST /run      — execute a URI
 ```
 
-Example run payload:
+POST body:
 
 ```json
-{
-  "uri": "android://device/app/query/status",
-  "payload": {}
-}
+{ "uri": "android://device/app/command/ping", "payload": {} }
 ```
 
-Initial routes:
+Available routes:
 
-```text
-android://device/app/query/status
-android://device/app/query/routes
-android://device/app/query/log
-android://device/app/command/ping
-android://device/termux/query/status
-android://device/termux/command/start
-android://device/termux/command/stop
+```
+android://device/app/query/status       device + service info
+android://device/app/query/routes       list routes
+android://device/app/query/log          recent event log (last 80 entries)
+android://device/app/command/ping       echo payload back
+
+android://device/termux/query/status    Termux subprocess status
+android://device/termux/command/start   launch Termux urirun node
+android://device/termux/command/stop    kill Termux urirun node
 ```
 
-The Termux routes are best-effort. They require a bootstrap script at:
+Termux routes require a bootstrap script at:
 
-```text
+```
 /data/data/com.termux/files/home/.urirun-node/run-node.sh
 ```
 
-## Build
+## Requirements
 
-Install the Android build toolchain first:
+| Component | Version |
+|---|---|
+| Android | 12+ (API 31) |
+| Architecture | arm64-v8a |
 
-```bash
-python3 -m pip install --user buildozer
-# install Java/JDK + Android SDK/NDK dependencies required by Buildozer
+## Install
+
+Download the APK from the host node server and install it:
+
+```
+http://HOST:8195/apk/urirunnode-0.3.0-arm64-v8a-debug.apk
 ```
 
-Then build:
+Or scan the QR code shown at `http://HOST:8195/`.
 
-```bash
-cd /home/tom/github/if-uri/urirun-android-node-app
-make apk
-```
-
-Publish the APK to the service that serves `http://HOST:8195/apk/`:
-
-```bash
-make publish-apk
-```
-
-The service checks this repo's `bin/` directory directly, so a successful
-Buildozer build is also enough for the APK to appear in `/apk/`.
-
-One-command build and publish:
-
-```bash
-./scripts/build-and-publish.sh
-```
-
-## Build in Docker
-
-If you do not want to install Buildozer and the Android toolchain directly on
-the host, build the debug APK in Docker:
-
-```bash
-cd /home/tom/github/if-uri/urirun-android-node-app
-make docker-apk
-```
-
-This builds the local image from `docker/Dockerfile.android-dev`, runs
-`buildozer android debug` with the repo mounted at `/work`, then copies
-`bin/*.apk` to:
-
-```text
-/home/tom/github/if-uri/urirun-service-android-node/apk
-```
-
-If Docker is installed but the command says the daemon is not reachable, run it
-from a normal host terminal with Docker access.
+Enable **Install from unknown sources** in Android settings before installing a debug APK.
 
 ## Test the URI API
 
-After installing and opening the APK on Android, read the URL shown in the app,
-then test from the host:
+After installing and opening the APK, note the IP shown in the app, then from the host:
 
 ```bash
 ./scripts/test-uri-api.sh http://ANDROID_IP:8765
 ```
 
-Equivalent raw calls:
+Or with raw curl:
 
 ```bash
 curl -fsS http://ANDROID_IP:8765/health
@@ -116,8 +92,112 @@ curl -fsS -X POST http://ANDROID_IP:8765/run \
   -d '{"uri":"android://device/app/command/ping","payload":{"from":"host"}}'
 ```
 
+## Build
+
+### Docker (recommended)
+
+No local Android toolchain needed. Requires Docker with access to the Docker daemon.
+
+```bash
+make docker-apk
+```
+
+This builds the image from `docker/Dockerfile.android-dev`, runs `buildozer android debug`
+inside the container, and copies the APK to:
+
+```
+/home/tom/github/if-uri/urirun-service-android-node/apk/
+```
+
+Skip rebuilding the Docker image on repeated runs:
+
+```bash
+URIRUN_ANDROID_BUILD_SKIP_IMAGE=1 make docker-apk
+```
+
+#### Build cache
+
+The Docker build uses two persistent host directories:
+
+| Variable | Default | Contents |
+|---|---|---|
+| `URIRUN_BUILDOZER_CACHE` | `~/.buildozer-cache` | Android SDK, NDK, p4a recipe builds |
+| `URIRUN_ANDROID_BUILD_HOME` | `~/.urirun-android-build-home` | pip user packages, Gradle cache |
+
+A cold build (empty cache) takes 60–90 minutes. A warm build (only dist + Gradle)
+takes 3–5 minutes.
+
+#### Rebuilding after code changes
+
+Only `main.py` and `service/main.py` change between builds. The dist is rebuilt
+automatically when the dist directory is absent. Delete only the dist to avoid
+invalidating the compiled recipe cache:
+
+```bash
+rm -rf .buildozer/android/platform/build-arm64-v8a/dists/urirunnode
+URIRUN_ANDROID_BUILD_SKIP_IMAGE=1 make docker-apk
+```
+
+Do **not** delete `bootstrap_builds/` — it contains git-cloned submodules
+(SDL2_image external deps) that cannot be re-fetched inside the network-isolated
+container.
+
+### Native (host buildozer)
+
+```bash
+make apk
+```
+
+Requires `buildozer`, a JDK, and Android SDK/NDK on the host.
+
+### Publish to APK server
+
+```bash
+make publish-apk
+```
+
+Copies `bin/*.apk` to the `urirun-service-android-node` APK directory so the
+file appears at `http://HOST:8195/apk/`.
+
+### Key build settings (`buildozer.spec`)
+
+| Setting | Value | Notes |
+|---|---|---|
+| `p4a.branch` | `release-2024.01.21` | Last stable release for Python 3.11 + NDK r25b |
+| `android.ndk` | `25b` | NDK r25b, Clang 14.0.6 |
+| `android.ndk_api` | `31` | Native API level compiled against |
+| `android.minapi` | `31` | Minimum Android version (API 31 = Android 12) |
+| `android.api` | `35` | Target API (Android 15) |
+| `android.services` | `nodeservice:service/main.py:foreground:sticky` | HTTP server service |
+| `android.no-byte-compile-python` | `True` | Ships `.py` source; avoids packager crash |
+
+`android.minapi` must equal `android.ndk_api` — p4a 2024.01.21 rejects a mismatch
+unless `--allow-minsdk-ndkapi-mismatch` is passed.
+
+#### hostpython3 recipe patch
+
+The `hostpython3` recipe (builds host-side Python used during compilation) requires
+a manual patch in `.buildozer/` to prevent NDK cross-compile flags from leaking
+into the host Python build and breaking `_posixsubprocess` and other shared modules:
+
+```python
+# .buildozer/android/platform/python-for-android/pythonforandroid/recipes/hostpython3/__init__.py
+def get_recipe_env(self, arch=None):
+    env = os.environ.copy()
+    env["CC"] = "gcc"
+    env["CXX"] = "g++"
+    for key in ("CFLAGS", "CXXFLAGS", "LDFLAGS", "CPPFLAGS", "ARCH", "LDSHARED"):
+        env.pop(key, None)
+    return env
+```
+
+This patch lives only inside `.buildozer/` (not in git) and must be re-applied
+after `buildozer android clean` or a fresh checkout.
+
 ## Local checks
 
 ```bash
 make check
 ```
+
+Runs `py_compile` on `main.py` and the pytest suite in `tests/`.
