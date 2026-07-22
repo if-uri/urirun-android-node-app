@@ -1,5 +1,8 @@
 # urirun-android-node-app
 
+The canonical Termux bootstrap served by `urirun-service-android-node` lives at
+`scripts/bootstrap-termux.sh`. The former `android-node-app` prototype is retired.
+
 Android application that exposes a URI node HTTP API directly on the device.
 
 Contrast with the webpage relay approach:

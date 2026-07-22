@@ -29,7 +29,6 @@ found=0
 for dir in \
   /home/tom/github/if-uri/urirun-service-android-node/apk \
   "$ROOT/bin" \
-  /home/tom/github/if-uri/android-node-app/bin \
   "$HOME/.urirun/android-node/apk"
 do
   echo "-- $dir"
@@ -63,4 +62,3 @@ else
   echo "RESULT: APK exists. If /apk/ is empty, restart:"
   echo "  /home/tom/github/if-uri/urirun/venv/bin/urirun-android-node restart --host 0.0.0.0 --port 8195 --force-replace"
 fi
-
