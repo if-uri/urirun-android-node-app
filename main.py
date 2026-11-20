@@ -80,19 +80,31 @@ def lan_ip() -> str:
 
 
 class UriRuntime:
-    def __init__(self, port: int = DEFAULT_PORT, *, url_opener: Callable[[str], bool] | None = None) -> None:
+    def __init__(
+        self,
+        port: int = DEFAULT_PORT,
+        *,
+        url_opener: Callable[[str], bool] | None = None,
+        state_verifier: Callable[[str, dict[str, Any]], bool] | None = None,
+    ) -> None:
         self.port = port
         self.started_at = time.time()
         self.events: list[dict[str, Any]] = []
         self.termux_proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self._url_opener = url_opener or _android_open_url
+        self._state_verifier = state_verifier
         self._heyasa_state: dict[str, Any] = {
             "activePanelUrl": None,
             "lastOpenedAt": None,
+            "lastFailedPanelUrl": None,
+            "lastOpenError": None,
             "lastConfirmedNoteId": None,
             "lastConfirmedStatus": None,
             "lastConfirmedAt": None,
+            "lastReportedNoteId": None,
+            "lastReportedStatus": None,
+            "lastReportedAt": None,
             "accessibilityEnabled": False,
         }
 
@@ -161,15 +173,29 @@ class UriRuntime:
         opened = bool(self._url_opener(url))
         now = time.time()
         with self.lock:
-            self._heyasa_state["activePanelUrl"] = url
-            self._heyasa_state["lastOpenedAt"] = now
+            if opened:
+                self._heyasa_state["activePanelUrl"] = url
+                self._heyasa_state["lastOpenedAt"] = now
+                self._heyasa_state["lastOpenError"] = None
+            else:
+                self._heyasa_state["lastFailedPanelUrl"] = url
+                self._heyasa_state["lastOpenError"] = "failed to open panel URL"
             state = dict(self._heyasa_state)
         self.log("heyasa-open-panel", opened=opened)
+        if not opened:
+            return {
+                "ok": False,
+                "opened": False,
+                "panelUrl": url,
+                "error": "failed to open panel URL",
+                "goalVerified": False,
+                "foregroundState": state,
+            }
         return {
             "ok": True,
-            "opened": opened,
+            "opened": True,
             "panelUrl": url,
-            "goalVerified": opened,
+            "goalVerified": True,
             "foregroundState": state,
         }
 
@@ -183,15 +209,31 @@ class UriRuntime:
         status = str(payload.get("status") or "confirmed").strip()
         if not note_id or len(note_id) > 64:
             return {"ok": False, "error": "note_id is required (1..64 chars)", "goalVerified": False}
-        verified = bool(payload.get("goal_verified", False))
+        caller_claimed = bool(payload.get("goal_verified", False))
         now = time.time()
         with self.lock:
-            self._heyasa_state["lastConfirmedNoteId"] = note_id
-            self._heyasa_state["lastConfirmedStatus"] = status[:32]
-            self._heyasa_state["lastConfirmedAt"] = now
+            snapshot = dict(self._heyasa_state)
+            self._heyasa_state["lastReportedNoteId"] = note_id
+            self._heyasa_state["lastReportedStatus"] = status[:32]
+            self._heyasa_state["lastReportedAt"] = now
+        verified = False
+        if self._state_verifier is not None and snapshot.get("activePanelUrl"):
+            verified = bool(self._state_verifier(note_id, snapshot))
+        with self.lock:
+            if verified:
+                self._heyasa_state["lastConfirmedNoteId"] = note_id
+                self._heyasa_state["lastConfirmedStatus"] = status[:32]
+                self._heyasa_state["lastConfirmedAt"] = now
             state = dict(self._heyasa_state)
-        self.log("heyasa-confirm-state", noteId=note_id, verified=verified)
-        return {"ok": True, "goalVerified": verified, "foregroundState": state}
+        verification_source = "runtime_verifier" if verified else "unverified_caller_assertion"
+        self.log("heyasa-confirm-state", noteId=note_id, verified=verified, source=verification_source)
+        return {
+            "ok": True,
+            "goalVerified": verified,
+            "callerAssertedGoalVerified": caller_claimed,
+            "verificationSource": verification_source,
+            "foregroundState": state,
+        }
 
     def handle_uri(self, uri: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}

@@ -79,17 +79,66 @@ def test_heyasa_open_panel_validation_and_foreground_state() -> None:
     assert ok["ok"] is True and ok["opened"] is True and ok["goalVerified"] is True
     assert opened_urls == ["https://heyasa.local/mobile/notes"]
 
-    confirmed = runtime.handle_uri(
+    # Without a trusted runtime state_verifier, caller-supplied goal_verified=True is untrusted.
+    unverified = runtime.handle_uri(
         "android://device/heyasa/command/confirm-state",
         {"note_id": "note_abc123", "status": "saved", "goal_verified": True},
     )
-    assert confirmed["ok"] is True and confirmed["goalVerified"] is True
+    assert unverified["ok"] is True
+    assert unverified["goalVerified"] is False
+    assert unverified["callerAssertedGoalVerified"] is True
+    assert unverified["verificationSource"] == "unverified_caller_assertion"
 
     state = runtime.handle_uri("android://device/heyasa/query/foreground-state")
     assert state["ok"] is True
     assert state["foregroundState"]["activePanelUrl"] == "https://heyasa.local/mobile/notes"
-    assert state["foregroundState"]["lastConfirmedNoteId"] == "note_abc123"
+    assert state["foregroundState"]["lastConfirmedNoteId"] is None
+    assert state["foregroundState"]["lastReportedNoteId"] == "note_abc123"
     assert state["foregroundState"]["accessibilityEnabled"] is False
+
+
+def test_heyasa_open_panel_failure_does_not_claim_active_panel() -> None:
+    runtime = UriRuntime(url_opener=lambda _url: False)
+    failed = runtime.handle_uri("android://device/heyasa/command/open-panel", {"url": "https://heyasa.local/mobile/notes"})
+    assert failed["ok"] is False
+    assert failed["opened"] is False
+    assert failed["goalVerified"] is False
+    assert failed["foregroundState"]["activePanelUrl"] is None
+    assert failed["foregroundState"]["lastOpenedAt"] is None
+    assert failed["foregroundState"]["lastFailedPanelUrl"] == "https://heyasa.local/mobile/notes"
+    assert failed["foregroundState"]["lastOpenError"] == "failed to open panel URL"
+
+
+def test_heyasa_confirm_state_uses_trusted_runtime_verifier() -> None:
+    runtime = UriRuntime(
+        url_opener=lambda _url: True,
+        state_verifier=lambda note_id, state: note_id == "note_verified" and bool(state.get("activePanelUrl")),
+    )
+    # Panel not open yet -> cannot verify.
+    before_open = runtime.handle_uri(
+        "android://device/heyasa/command/confirm-state",
+        {"note_id": "note_verified", "status": "saved", "goal_verified": True},
+    )
+    assert before_open["ok"] is True and before_open["goalVerified"] is False
+
+    runtime.handle_uri("android://device/heyasa/command/open-panel", {"url": "https://heyasa.local/mobile/notes"})
+    verified = runtime.handle_uri(
+        "android://device/heyasa/command/confirm-state",
+        {"note_id": "note_verified", "status": "saved", "goal_verified": False},
+    )
+    assert verified["ok"] is True
+    assert verified["goalVerified"] is True
+    assert verified["verificationSource"] == "runtime_verifier"
+    assert verified["foregroundState"]["lastConfirmedNoteId"] == "note_verified"
+
+    rejected = runtime.handle_uri(
+        "android://device/heyasa/command/confirm-state",
+        {"note_id": "note_forged", "status": "saved", "goal_verified": True},
+    )
+    assert rejected["ok"] is True
+    assert rejected["goalVerified"] is False
+    assert rejected["verificationSource"] == "unverified_caller_assertion"
+    assert rejected["foregroundState"]["lastConfirmedNoteId"] == "note_verified"
 
 
 def test_server_enforces_bearer_auth_and_rejects_query_tokens() -> None:
