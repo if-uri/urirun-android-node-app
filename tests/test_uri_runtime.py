@@ -1,4 +1,21 @@
-from main import ROUTES, UriRuntime
+import json
+import urllib.error
+import urllib.request
+
+from main import ROUTES, UriNodeServer, UriRuntime
+
+
+def _http_json(url: str, *, method: str = "GET", headers: dict[str, str] | None = None, body: dict | None = None) -> tuple[int, dict]:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    hdrs = dict(headers or {})
+    if data is not None:
+        hdrs.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
 def test_status_route() -> None:
@@ -44,3 +61,60 @@ def test_start_termux_fails_cleanly_when_bootstrap_missing() -> None:
     out = runtime.handle_uri("android://device/termux/command/start")
     assert out["ok"] is False
     assert "not found" in out["error"]
+
+
+def test_heyasa_open_panel_validation_and_foreground_state() -> None:
+    opened_urls: list[str] = []
+    runtime = UriRuntime(url_opener=lambda url: (opened_urls.append(url), True)[1])
+
+    bad = runtime.handle_uri("android://device/heyasa/command/open-panel", {"url": "javascript:alert(1)"})
+    assert bad["ok"] is False and bad["goalVerified"] is False
+
+    bad_creds = runtime.handle_uri("android://device/heyasa/command/open-panel", {"url": "https://user:pass@heyasa.local/mobile/notes"})
+    assert bad_creds["ok"] is False
+
+    ok = runtime.handle_uri("android://device/heyasa/command/open-panel", {"url": "https://heyasa.local/mobile/notes"})
+    assert ok["ok"] is True and ok["opened"] is True and ok["goalVerified"] is True
+    assert opened_urls == ["https://heyasa.local/mobile/notes"]
+
+    confirmed = runtime.handle_uri(
+        "android://device/heyasa/command/confirm-state",
+        {"note_id": "note_abc123", "status": "saved", "goal_verified": True},
+    )
+    assert confirmed["ok"] is True and confirmed["goalVerified"] is True
+
+    state = runtime.handle_uri("android://device/heyasa/query/foreground-state")
+    assert state["ok"] is True
+    assert state["foregroundState"]["activePanelUrl"] == "https://heyasa.local/mobile/notes"
+    assert state["foregroundState"]["lastConfirmedNoteId"] == "note_abc123"
+    assert state["foregroundState"]["accessibilityEnabled"] is False
+
+
+def test_server_enforces_bearer_auth_and_rejects_query_tokens() -> None:
+    runtime = UriRuntime(port=0, url_opener=lambda _url: True)
+    server = UriNodeServer(runtime, host="127.0.0.1", port=0, auth_token="secret-android-token-123")
+    server.start()
+    assert server.httpd is not None
+    port = server.httpd.server_address[1]
+    base = f"http://127.0.0.1:{port}"
+    try:
+        code, _ = _http_json(f"{base}/health")
+        assert code == 401
+        code, _ = _http_json(f"{base}/health", headers={"Authorization": "Bearer wrong"})
+        assert code == 401
+        code, _ = _http_json(f"{base}/health?token=secret-android-token-123")
+        assert code == 403
+
+        hdr = {"Authorization": "Bearer secret-android-token-123"}
+        code, health = _http_json(f"{base}/health", headers=hdr)
+        assert code == 200 and health["ok"] is True
+
+        code, res = _http_json(
+            f"{base}/run",
+            method="POST",
+            headers=hdr,
+            body={"uri": "android://device/heyasa/command/open-panel", "payload": {"url": "https://heyasa.local/mobile/notes"}},
+        )
+        assert code == 200 and res["goalVerified"] is True
+    finally:
+        server.stop()
