@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import socket
@@ -8,12 +9,14 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, Callable
+from urllib.parse import parse_qsl, urlparse, urlsplit
 
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 DEFAULT_PORT = int(os.environ.get("URIRUN_ANDROID_APP_PORT", "8765"))
+DEFAULT_AUTH_TOKEN = os.environ.get("URIRUN_ANDROID_AUTH_TOKEN", "").strip()
+_SECRET_QUERY_KEYS = frozenset({"token", "auth", "access_token", "session_token", "api_key", "key"})
 TERMUX_HOME = "/data/data/com.termux/files/home"
 TERMUX_RUN_SCRIPT = os.environ.get(
     "URIRUN_TERMUX_RUN_SCRIPT",
@@ -32,7 +35,39 @@ ROUTES = [
     {"uri": "android://device/termux/query/status", "kind": "query", "title": "Termux node status"},
     {"uri": "android://device/termux/command/start", "kind": "command", "title": "Start Termux urirun node"},
     {"uri": "android://device/termux/command/stop", "kind": "command", "title": "Stop Termux urirun node"},
+    {"uri": "android://device/heyasa/command/open-panel", "kind": "command", "title": "Open HeyAsa mobile panel URL"},
+    {"uri": "android://device/heyasa/query/foreground-state", "kind": "query", "title": "Query HeyAsa panel foreground state"},
+    {"uri": "android://device/heyasa/command/confirm-state", "kind": "command", "title": "Record verified HeyAsa note/action state"},
 ]
+
+
+def _validate_panel_url(raw_url: str) -> str:
+    url = str(raw_url or "").strip()
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or len(url) > 512
+        or any(ch.isspace() or ord(ch) < 32 for ch in url)
+    ):
+        raise ValueError("open-panel requires a valid http(s) URL without credentials or control characters")
+    return url
+
+
+def _android_open_url(url: str) -> bool:
+    try:
+        from jnius import autoclass  # type: ignore[import]
+        Intent = autoclass("android.content.Intent")
+        Uri = autoclass("android.net.Uri")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        PythonActivity.mActivity.startActivity(intent)
+        return True
+    except Exception:
+        return False
 
 
 def lan_ip() -> str:
@@ -45,12 +80,21 @@ def lan_ip() -> str:
 
 
 class UriRuntime:
-    def __init__(self, port: int = DEFAULT_PORT) -> None:
+    def __init__(self, port: int = DEFAULT_PORT, *, url_opener: Callable[[str], bool] | None = None) -> None:
         self.port = port
         self.started_at = time.time()
         self.events: list[dict[str, Any]] = []
         self.termux_proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
+        self._url_opener = url_opener or _android_open_url
+        self._heyasa_state: dict[str, Any] = {
+            "activePanelUrl": None,
+            "lastOpenedAt": None,
+            "lastConfirmedNoteId": None,
+            "lastConfirmedStatus": None,
+            "lastConfirmedAt": None,
+            "accessibilityEnabled": False,
+        }
 
     def log(self, event: str, **detail: Any) -> None:
         row = {"ts": time.time(), "event": event, **detail}
@@ -109,6 +153,46 @@ class UriRuntime:
         self.log("termux-stopped", pid=pid)
         return {"ok": True, "pid": pid}
 
+    def open_heyasa_panel(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            url = _validate_panel_url(str(payload.get("url") or ""))
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "goalVerified": False}
+        opened = bool(self._url_opener(url))
+        now = time.time()
+        with self.lock:
+            self._heyasa_state["activePanelUrl"] = url
+            self._heyasa_state["lastOpenedAt"] = now
+            state = dict(self._heyasa_state)
+        self.log("heyasa-open-panel", opened=opened)
+        return {
+            "ok": True,
+            "opened": opened,
+            "panelUrl": url,
+            "goalVerified": opened,
+            "foregroundState": state,
+        }
+
+    def foreground_state(self) -> dict[str, Any]:
+        with self.lock:
+            state = dict(self._heyasa_state)
+        return {"ok": True, "foregroundState": state}
+
+    def confirm_heyasa_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        note_id = str(payload.get("note_id") or "").strip()
+        status = str(payload.get("status") or "confirmed").strip()
+        if not note_id or len(note_id) > 64:
+            return {"ok": False, "error": "note_id is required (1..64 chars)", "goalVerified": False}
+        verified = bool(payload.get("goal_verified", False))
+        now = time.time()
+        with self.lock:
+            self._heyasa_state["lastConfirmedNoteId"] = note_id
+            self._heyasa_state["lastConfirmedStatus"] = status[:32]
+            self._heyasa_state["lastConfirmedAt"] = now
+            state = dict(self._heyasa_state)
+        self.log("heyasa-confirm-state", noteId=note_id, verified=verified)
+        return {"ok": True, "goalVerified": verified, "foregroundState": state}
+
     def handle_uri(self, uri: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
         parsed = urlparse(uri)
@@ -130,19 +214,34 @@ class UriRuntime:
             return self.start_termux()
         if route == "device/termux/command/stop":
             return self.stop_termux()
+        if route == "device/heyasa/command/open-panel":
+            return self.open_heyasa_panel(payload)
+        if route == "device/heyasa/query/foreground-state":
+            return self.foreground_state()
+        if route == "device/heyasa/command/confirm-state":
+            return self.confirm_heyasa_state(payload)
         return {"ok": False, "error": f"unknown android route: {route}", "uri": uri}
 
 
 class UriNodeServer:
-    def __init__(self, runtime: UriRuntime, host: str = "0.0.0.0", port: int = DEFAULT_PORT) -> None:
+    def __init__(
+        self,
+        runtime: UriRuntime,
+        host: str = "0.0.0.0",
+        port: int = DEFAULT_PORT,
+        *,
+        auth_token: str | None = None,
+    ) -> None:
         self.runtime = runtime
         self.host = host
         self.port = port
+        self.auth_token = (DEFAULT_AUTH_TOKEN if auth_token is None else str(auth_token)).strip()
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
 
     def start(self) -> None:
         runtime = self.runtime
+        expected_token = self.auth_token
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, fmt: str, *args: Any) -> None:
@@ -153,11 +252,31 @@ class UriNodeServer:
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Access-Control-Allow-Origin", "*")
+                if not expected_token:
+                    self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _authorize(self) -> bool:
+                for key, val in parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+                    if key.lower() in _SECRET_QUERY_KEYS or val.startswith("hts_"):
+                        self.send_json(403, {"ok": False, "error": "tokens must not be passed in query string"})
+                        return False
+                if not expected_token:
+                    return True
+                auth_hdr = str(self.headers.get("Authorization") or "")
+                if not auth_hdr.startswith("Bearer "):
+                    self.send_json(401, {"ok": False, "error": "bearer token required"})
+                    return False
+                supplied = auth_hdr[7:].strip()
+                if not supplied or not hmac.compare_digest(supplied, expected_token):
+                    self.send_json(401, {"ok": False, "error": "invalid bearer token"})
+                    return False
+                return True
+
             def do_GET(self) -> None:
+                if not self._authorize():
+                    return
                 if self.path.split("?", 1)[0] == "/health":
                     self.send_json(200, runtime.status())
                     return
@@ -167,6 +286,8 @@ class UriNodeServer:
                 self.send_json(404, {"ok": False, "error": "not found"})
 
             def do_POST(self) -> None:
+                if not self._authorize():
+                    return
                 if self.path.split("?", 1)[0] != "/run":
                     self.send_json(404, {"ok": False, "error": "not found"})
                     return
@@ -202,7 +323,10 @@ def _poll_service(port: int) -> dict[str, Any]:
     """Fetch /health from the background service (localhost).  Returns a status dict."""
     try:
         url = f"http://127.0.0.1:{port}/health"
-        req = urllib.request.Request(url, headers={"Connection": "close"})
+        headers = {"Connection": "close"}
+        if DEFAULT_AUTH_TOKEN:
+            headers["Authorization"] = f"Bearer {DEFAULT_AUTH_TOKEN}"
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=1) as resp:
             return json.loads(resp.read().decode())
     except Exception:
@@ -214,9 +338,10 @@ def _post_service(port: int, uri: str) -> dict[str, Any]:
     try:
         body = json.dumps({"uri": uri}).encode()
         url = f"http://127.0.0.1:{port}/run"
-        req = urllib.request.Request(url, data=body,
-                                     headers={"Content-Type": "application/json",
-                                              "Connection": "close"})
+        headers = {"Content-Type": "application/json", "Connection": "close"}
+        if DEFAULT_AUTH_TOKEN:
+            headers["Authorization"] = f"Bearer {DEFAULT_AUTH_TOKEN}"
+        req = urllib.request.Request(url, data=body, headers=headers)
         with urllib.request.urlopen(req, timeout=3) as resp:
             return json.loads(resp.read().decode())
     except Exception as exc:
