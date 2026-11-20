@@ -1,5 +1,7 @@
 import json
+import secrets
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from main import ROUTES, UriNodeServer, UriRuntime
@@ -92,7 +94,9 @@ def test_heyasa_open_panel_validation_and_foreground_state() -> None:
 
 def test_server_enforces_bearer_auth_and_rejects_query_tokens() -> None:
     runtime = UriRuntime(port=0, url_opener=lambda _url: True)
-    server = UriNodeServer(runtime, host="127.0.0.1", port=0, auth_token="secret-android-token-123")
+    bearer_secret = secrets.token_urlsafe(16)
+    server_opts = {"auth_token": bearer_secret}
+    server = UriNodeServer(runtime, host="127.0.0.1", port=0, **server_opts)
     server.start()
     assert server.httpd is not None
     port = server.httpd.server_address[1]
@@ -102,10 +106,11 @@ def test_server_enforces_bearer_auth_and_rejects_query_tokens() -> None:
         assert code == 401
         code, _ = _http_json(f"{base}/health", headers={"Authorization": "Bearer wrong"})
         assert code == 401
-        code, _ = _http_json(f"{base}/health?token=secret-android-token-123")
+        query = urllib.parse.urlencode({"token": bearer_secret})
+        code, _ = _http_json(f"{base}/health?{query}")
         assert code == 403
 
-        hdr = {"Authorization": "Bearer secret-android-token-123"}
+        hdr = {"Authorization": f"Bearer {bearer_secret}"}
         code, health = _http_json(f"{base}/health", headers=hdr)
         assert code == 200 and health["ok"] is True
 
